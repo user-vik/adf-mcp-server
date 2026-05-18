@@ -10,6 +10,12 @@
   "scripts": {
     "start": "node index.js"
   },
+  "license": "MIT",
+  "author": "Victor Perez",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/user-vik/adf-mcp-server.git"
+  },
   "dependencies": {
     "@azure/identity": "^4.5.0",
     "@modelcontextprotocol/sdk": "^1.18.0",

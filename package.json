@@ -1,0 +1,21 @@
+{
+  "name": "adf-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for classic Azure Data Factory (V2) pipeline troubleshooting",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "adf-mcp-server": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

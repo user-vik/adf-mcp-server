@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "adf-mcp-server": "./index.js"
+    "adf-mcp-server": "index.js"
   },
   "scripts": {
     "start": "node index.js",

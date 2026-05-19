@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -11,6 +12,11 @@ import {
   ManagedIdentityCredential,
 } from "@azure/identity";
 import { z } from "zod";
+
+// Single source of truth for the server's version — keeps `package.json`
+// and the MCP server identity in sync without manual edits.
+const PACKAGE = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+const VERSION = PACKAGE.version;
 
 const FACTORY_ID = process.env.ADF_FACTORY_RESOURCE_ID;
 if (!FACTORY_ID) {
@@ -264,6 +270,7 @@ if (DESTRUCTIVE_ENABLED) {
 // back. Tokens expire after PLAN_TTL_MS. Captured ETag enforces optimistic
 // concurrency on the apply via If-Match.
 const PLAN_TTL_MS = 10 * 60 * 1000;
+const PLAN_STORE_MAX = 100;
 const pendingPlans = new Map();
 
 function hashPayload(payload) {
@@ -271,6 +278,13 @@ function hashPayload(payload) {
 }
 
 function createPlanToken(toolName, target, payload, etag) {
+  // Bound the store: evict the oldest entry (Map preserves insertion order)
+  // when at capacity. Prevents a buggy client from exhausting memory before
+  // the periodic sweep runs.
+  if (pendingPlans.size >= PLAN_STORE_MAX) {
+    const oldest = pendingPlans.keys().next().value;
+    if (oldest !== undefined) pendingPlans.delete(oldest);
+  }
   const token = crypto.randomUUID();
   const expiresAt = Date.now() + PLAN_TTL_MS;
   pendingPlans.set(token, {
@@ -365,7 +379,7 @@ async function executePlanApply({
   }
 }
 
-const server = new McpServer({ name: "adf-mcp", version: "0.4.0" });
+const server = new McpServer({ name: "adf-mcp", version: VERSION });
 
 server.registerTool(
   "list_pipelines",

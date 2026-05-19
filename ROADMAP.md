@@ -78,14 +78,32 @@ Gated behind both `ADF_MCP_MODE=write` and `ADF_MCP_ALLOW_DELETE=true`.
 - [x] ETag concurrency via `If-Match` so a resource modified between plan and
       apply is rejected with HTTP 412.
 
-## Stage 7 — Packaging & distribution
+## Stage 7 — Packaging & distribution _(done — shipped in 1.0.0)_
 
-- Publish to npm so users can `npx adf-mcp-server`.
-- Dockerfile for hosting on Azure Container Apps / AKS with managed identity.
-- GitHub Actions release workflow tied to `CHANGELOG.md` entries.
-- Cut `1.0.0` once write tools land.
+- [x] CI workflow (lint + format:check + audit on push/PR).
+- [x] Release workflow (npm publish with provenance on `v*` tag push).
+- [x] Dockerfile (multi-stage, non-root) for managed-identity hosting.
+- [x] `SECURITY.md` with disclosure process and known limitations.
+- [x] `package.json` `files` allowlist + `keywords` for npm discovery.
+- [x] Server version read from `package.json` (single source of truth).
+- [x] Plan-store size cap (100) to bound memory.
+- [x] Cut `1.0.0` — first release with stable contract.
 
-## Out of scope (for now)
+## Beyond 1.0 — deferred enhancements
+
+These are documented in `SECURITY.md` as known limitations and revisited in
+post-1.0 minors.
+
+- **Test suite** — `vitest` + recorded HTTP fixtures (`nock`). Will exercise
+  the auth-mode factory, gate logic, plan/apply state machine, and ARM
+  response shape parsers.
+- **`nextLink` pagination** for the `list_*` family. Today they return only
+  the first ARM page (~50–100 items).
+- **Type checking** via `// @ts-check` + JSDoc or a full TS conversion.
+- **Split `AZURE_CLIENT_ID`** into mode-specific env vars
+  (`ADF_SP_CLIENT_ID`, `ADF_MI_CLIENT_ID`) — breaking change, defer to 2.0.
+
+## Permanently out of scope
 
 - Debug-run support (`Debug` endpoint requires factory-level Contributor and
   carries different auditing semantics).

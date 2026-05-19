@@ -51,6 +51,18 @@ Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop,
 
 ## Install
 
+### From npm (recommended)
+
+```sh
+# One-off run via npx — no global install needed
+npx adf-mcp-server
+
+# Or install globally
+npm install -g adf-mcp-server
+```
+
+### From source (for development or to pin to a commit)
+
 ```sh
 git clone https://github.com/user-vik/adf-mcp-server
 cd adf-mcp-server
@@ -195,6 +207,28 @@ Without the token, an LLM could skip the plan step entirely. Requiring a token m
 
 The identity needs **Data Factory Contributor** on the factory (same role as write mode — no additional permissions, because ADF doesn't model "can create but not delete" separately at the RBAC level).
 
+## Docker / managed identity
+
+A `Dockerfile` is included for hosting the server on Azure (Container Apps, App Service, AKS, or a VM) with a managed identity — no client secrets in env vars.
+
+```sh
+docker build -t adf-mcp-server .
+```
+
+Typical deployment pattern on Azure Container Apps:
+
+1. Grant the Container App's system-assigned managed identity **Data Factory Contributor** on the target factory.
+2. Configure the container with:
+   ```
+   ADF_FACTORY_RESOURCE_ID=/subscriptions/.../factories/...
+   ADF_AUTH_MODE=managed-identity
+   ADF_MCP_MODE=write           # if you want write tools
+   ADF_MCP_ALLOW_DELETE=true    # if you want destructive tools
+   ```
+3. Use an `azureContainerAppsApi`-style transport from your MCP client (out of scope for this server — stdio MCP usually runs locally; this section is for centralized deployments that proxy stdio via a sidecar).
+
+The image runs as a non-root user (`adf`, uid auto-assigned). Stdio is the only entrypoint; no ports are exposed.
+
 ## Run standalone (for debugging)
 
 ```sh
@@ -225,10 +259,13 @@ The server speaks MCP over stdio, so running it directly will just block waiting
 
 For everything else, check the project [issues](https://github.com/user-vik/adf-mcp-server/issues).
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the disclosure process, in/out-of-scope items, and known design limitations.
+
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the staged plan — additional auth methods,
-write-capable tools (run/cancel/start/stop), packaging, and more.
+See [ROADMAP.md](ROADMAP.md) for the staged plan and what's intentionally deferred.
 
 ## Changelog
 

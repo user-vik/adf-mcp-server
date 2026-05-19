@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0]
+
+First stable release. The 0.x line was a series of breaking surface
+expansions (auth modes, write tools, destructive tools); 1.0.0 marks the
+point where the tool, env-var, and gating contracts are committed and
+SemVer kicks in.
+
+### Added
+- GitHub Actions **CI workflow** (`.github/workflows/ci.yml`) running
+  `npm run lint`, `npm run format:check`, `node --check index.js`, and
+  `npm audit --omit=dev` on every push and PR.
+- GitHub Actions **release workflow** (`.github/workflows/release.yml`)
+  publishing to npm with provenance when a `v*` tag is pushed. Requires
+  a `NPM_TOKEN` repository secret.
+- **`Dockerfile`** (multi-stage, alpine, non-root) for hosting the server
+  on Azure with managed identity. Companion `.dockerignore`.
+- **`SECURITY.md`** with explicit disclosure process, in/out-of-scope
+  items, and a list of known design limitations.
+- README sections: "Install from npm", "Docker / managed identity",
+  and a link to `SECURITY.md`.
+- `package.json` gains `files`, `publishConfig`, and `keywords` for npm
+  discoverability and to keep the published tarball minimal.
+- Plan-store capacity cap (`PLAN_STORE_MAX = 100`) — when full,
+  the oldest entry is evicted before insert. Prevents memory exhaustion
+  if a buggy client floods plans faster than the TTL sweep runs.
+
+### Changed
+- Server version is now read from `package.json` at startup instead of
+  being hard-coded in `new McpServer({ version })`. Single source of truth.
+
+### Known limitations (intentional)
+- No automated test suite — manual smoke tests only.
+- `list_*` tools don't follow ARM `nextLink`; factories with hundreds of
+  pipelines/datasets/etc. will see only the first ARM page.
+- `AZURE_CLIENT_ID` is overloaded across auth modes (CLI public client /
+  SP app reg / user-assigned MI). Documented in `.env.example`.
+- Plan/apply tokens are in-memory only and do not survive a restart.
+
 ## [0.4.0]
 
 ### Added
@@ -117,7 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive browser authentication via `@azure/identity`.
 - MIT license and `package.json` metadata for distribution.
 
-[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.4.0...v1.0.0
 [0.4.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.1.0...v0.2.0

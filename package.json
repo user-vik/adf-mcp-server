@@ -1,6 +1,6 @@
 {
   "name": "adf-mcp-server",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "description": "MCP server for classic Azure Data Factory (V2) pipeline troubleshooting",
   "type": "module",
   "main": "index.js",
@@ -20,6 +20,25 @@
     "type": "git",
     "url": "git+https://github.com/user-vik/adf-mcp-server.git"
   },
+  "files": [
+    "index.js",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "azure",
+    "azure-data-factory",
+    "adf",
+    "claude",
+    "anthropic"
+  ],
   "dependencies": {
     "@azure/identity": "^4.5.0",
     "@modelcontextprotocol/sdk": "^1.18.0",

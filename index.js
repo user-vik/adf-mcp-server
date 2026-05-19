@@ -1,22 +1,83 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { InteractiveBrowserCredential } from "@azure/identity";
+import {
+  AzureCliCredential,
+  ClientSecretCredential,
+  DefaultAzureCredential,
+  DeviceCodeCredential,
+  InteractiveBrowserCredential,
+  ManagedIdentityCredential,
+} from "@azure/identity";
 import { z } from "zod";
 
 const FACTORY_ID = process.env.ADF_FACTORY_RESOURCE_ID;
-const TENANT_ID = process.env.AZURE_TENANT_ID;
-const CLIENT_ID = process.env.AZURE_CLIENT_ID || "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
-
-if (!FACTORY_ID || !TENANT_ID) {
-  console.error("Missing required env vars. Need: ADF_FACTORY_RESOURCE_ID, AZURE_TENANT_ID");
+if (!FACTORY_ID) {
+  console.error("Missing required env var: ADF_FACTORY_RESOURCE_ID");
   process.exit(1);
 }
 
-const credential = new InteractiveBrowserCredential({
-  tenantId: TENANT_ID,
-  clientId: CLIENT_ID,
-});
+const AUTH_MODES = [
+  "interactive",
+  "device-code",
+  "cli",
+  "service-principal",
+  "managed-identity",
+  "default",
+];
+// Public Azure CLI client ID — safe default for user-flow modes only.
+const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+
+function requireEnv(value, name, mode) {
+  if (!value) {
+    console.error(`ADF_AUTH_MODE=${mode} requires ${name}`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function buildCredential() {
+  const mode = (process.env.ADF_AUTH_MODE || "interactive").toLowerCase();
+  if (!AUTH_MODES.includes(mode)) {
+    console.error(`Invalid ADF_AUTH_MODE "${mode}". Valid: ${AUTH_MODES.join(", ")}`);
+    process.exit(1);
+  }
+  const tenantId = process.env.AZURE_TENANT_ID;
+  const clientId = process.env.AZURE_CLIENT_ID;
+  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+
+  switch (mode) {
+    case "interactive":
+      return new InteractiveBrowserCredential({
+        tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        clientId: clientId || AZURE_CLI_CLIENT_ID,
+      });
+    case "device-code":
+      return new DeviceCodeCredential({
+        tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        clientId: clientId || AZURE_CLI_CLIENT_ID,
+        // Default callback writes to stdout, which would corrupt the MCP
+        // protocol stream. Redirect to stderr so the MCP client logs it.
+        userPromptCallback: (info) => {
+          console.error(`[adf-mcp] ${info.message}`);
+        },
+      });
+    case "cli":
+      return new AzureCliCredential(tenantId ? { tenantId } : undefined);
+    case "service-principal":
+      return new ClientSecretCredential(
+        requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        requireEnv(clientId, "AZURE_CLIENT_ID", mode),
+        requireEnv(clientSecret, "AZURE_CLIENT_SECRET", mode),
+      );
+    case "managed-identity":
+      return new ManagedIdentityCredential(clientId ? { clientId } : undefined);
+    case "default":
+      return new DefaultAzureCredential(tenantId ? { tenantId } : undefined);
+  }
+}
+
+const credential = buildCredential();
 const API_VERSION = "2018-06-01";
 const ARM_BASE = "https://management.azure.com";
 

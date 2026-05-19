@@ -24,10 +24,10 @@ style; no behavior changes.
 - [x] `CONTRIBUTING.md` describing branching, Conventional Commits, and PR checklist.
 - [x] `.github/ISSUE_TEMPLATE/bug.md`, `feature.md`, `pull_request_template.md`.
 
-## Stage 3 — Auth methods refactor
+## Stage 3 — Auth methods refactor _(done)_
 
-Replace the hard-coded `InteractiveBrowserCredential` with a credential chain
-selected by `ADF_AUTH_MODE`:
+Replaced the hard-coded `InteractiveBrowserCredential` with a credential
+factory selected by `ADF_AUTH_MODE`:
 
 | `ADF_AUTH_MODE`           | Credential                     | Use case                              |
 | ------------------------- | ------------------------------ | ------------------------------------- |
@@ -38,7 +38,8 @@ selected by `ADF_AUTH_MODE`:
 | `managed-identity`        | `ManagedIdentityCredential`    | MCP server hosted on Azure            |
 | `default`                 | `DefaultAzureCredential`       | Chain that tries everything in turn   |
 
-Default keeps current behavior. README + `.env.example` updated.
+Default preserves prior behavior. README + `.env.example` updated. Invalid
+modes or missing required env vars exit with a clear error at startup.
 
 ## Stage 4 — Quality-of-life read tools
 

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ADF_AUTH_MODE` env var selecting from six credential types: `interactive`
+  (default), `device-code`, `cli`, `service-principal`, `managed-identity`,
+  `default`. Default preserves prior behavior.
+- `AZURE_CLIENT_SECRET` env var (required only for `service-principal` mode).
+- README "Authentication modes" section with per-mode requirements and notes.
 - `.env.example` documenting supported environment variables.
 - `.editorconfig` enforcing consistent indentation and line endings.
 - `.gitattributes` enforcing LF line endings cross-platform.

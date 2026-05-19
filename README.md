@@ -1,6 +1,6 @@
 # adf-mcp-server
 
-MCP server for classic Azure Data Factory (V2) pipeline troubleshooting. Exposes ARM read tools for pipelines, pipeline runs, activity runs, and triggers over stdio, using interactive browser auth.
+MCP server for classic Azure Data Factory (V2) pipeline troubleshooting. Exposes ARM read tools for pipelines, pipeline runs, activity runs, and triggers over stdio. Supports six Entra auth modes — interactive browser, device code, Azure CLI session, service principal, managed identity, or auto-detect.
 
 ## What it does
 
@@ -33,11 +33,13 @@ npm install
 
 The server reads everything from environment variables — typically set inside your MCP client config rather than the shell.
 
-| Variable                  | Required | Notes                                                                                                                     |
-| ------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `ADF_FACTORY_RESOURCE_ID` | yes      | Full ARM resource ID, e.g. `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DataFactory/factories/<factory>` |
-| `AZURE_TENANT_ID`         | yes      | Entra tenant ID                                                                                                           |
-| `AZURE_CLIENT_ID`         | no       | Defaults to the Azure CLI public client (`04b07795-8ddb-461a-bbee-02f9e1bf7b46`)                                          |
+| Variable                  | Required                                                | Notes                                                                                                                                               |
+| ------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ADF_FACTORY_RESOURCE_ID` | always                                                  | Full ARM resource ID, e.g. `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DataFactory/factories/<factory>`                           |
+| `ADF_AUTH_MODE`           | no                                                      | Auth credential to use. Defaults to `interactive`. See **Authentication modes** below.                                                              |
+| `AZURE_TENANT_ID`         | for `interactive` / `device-code` / `service-principal` | Entra tenant ID.                                                                                                                                    |
+| `AZURE_CLIENT_ID`         | for `service-principal`                                 | Optional for `interactive`/`device-code` (defaults to Azure CLI public client). For `managed-identity`, set only when targeting a user-assigned MI. |
+| `AZURE_CLIENT_SECRET`     | for `service-principal`                                 | Treat as a secret. Never commit.                                                                                                                    |
 
 ## Wiring into an MCP client
 
@@ -61,11 +63,29 @@ Add an entry to your client's MCP config. Example (Claude Code / Claude Desktop 
 
 Restart the MCP client after editing the config.
 
-## First-run auth
+## Authentication modes
 
-On the first tool call the server uses `InteractiveBrowserCredential`. A browser tab opens asking you to sign in to Azure with your Entra account. The token is cached in memory for the lifetime of the process; subsequent calls reuse it.
+Set `ADF_AUTH_MODE` to pick how the server obtains an Entra token. Default is `interactive`, which preserves prior behavior.
 
-Because this is interactive user auth, the effective permissions on ARM are your own personal RBAC on the factory — not a service principal's.
+| Mode                      | Credential                     | Use case                                                                                        | Required env (beyond `ADF_FACTORY_RESOURCE_ID`)             |
+| ------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `interactive` _(default)_ | `InteractiveBrowserCredential` | Desktop devs — opens a browser tab on first call.                                               | `AZURE_TENANT_ID`                                           |
+| `device-code`             | `DeviceCodeCredential`         | SSH / WSL / headless — prints a code + URL to stderr (the MCP client's server log).             | `AZURE_TENANT_ID`                                           |
+| `cli`                     | `AzureCliCredential`           | Devs already signed in via `az login`. Zero prompts.                                            | _(none — uses CLI session)_                                 |
+| `service-principal`       | `ClientSecretCredential`       | CI, shared servers, automation.                                                                 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
+| `managed-identity`        | `ManagedIdentityCredential`    | MCP server hosted on an Azure VM, Container App, App Service, etc.                              | _(none — uses the host identity)_                           |
+| `default`                 | `DefaultAzureCredential`       | Chain: env vars → managed identity → CLI → VS Code → interactive browser. Easiest "just works." | _(varies by what's available)_                              |
+
+On the first tool call, the chosen credential acquires a token at the `https://management.azure.com/.default` scope. Tokens are cached in memory for the lifetime of the process; subsequent calls reuse them.
+
+For all user-flow modes (`interactive`, `device-code`, `cli`), the effective ARM permissions are _your own_ personal RBAC on the factory. For `service-principal` and `managed-identity`, they are the SP's or MI's RBAC — grant that identity at least **Reader** on the factory.
+
+### Mode-specific notes
+
+- **`device-code`**: the message containing the verification URL and one-time code is written to **stderr**, which most MCP clients route to their server log rather than the chat. In Claude Code, view it via `/mcp` → server logs. The auth call blocks until you complete the flow in a browser.
+- **`service-principal`**: `AZURE_CLIENT_ID` here is the SP's app registration, _not_ the Azure CLI public client default.
+- **`managed-identity`**: omit `AZURE_CLIENT_ID` for a system-assigned MI; set it to the MI's client ID for a user-assigned MI.
+- **`default`**: opaque when something fails. If `DefaultAzureCredential` errors with "no credential was found", switch to a specific mode to see which one is actually failing.
 
 ## Run standalone (for debugging)
 
@@ -77,15 +97,17 @@ The server speaks MCP over stdio, so running it directly will just block waiting
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                           | Fix                                                                                                                                                          |
-| ---------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Missing required env vars` on startup   | `ADF_FACTORY_RESOURCE_ID` or `AZURE_TENANT_ID` not set in the MCP client's `env` block | Add them to the client config and restart the client.                                                                                                        |
-| Tool call returns `403` from ARM         | Your account lacks RBAC on the factory                                                 | Ask the resource owner to grant at least **Reader** on the Data Factory resource (Portal → ADF → Access control (IAM)).                                      |
-| Tool call returns `401` / token errors   | Conditional Access or MFA blocked the silent token                                     | Sign out of Azure CLI / browser sessions, then re-trigger any tool to force a fresh interactive sign-in.                                                     |
-| Browser tab never opens on first call    | Running over SSH / inside WSL / on a headless host                                     | Interactive browser auth needs a desktop. See Roadmap → Stage 3 for the upcoming `device-code` mode; until then, run the client on a machine with a browser. |
-| MCP client says "server failed to start" | Wrong path in `args`, or Node not on PATH for the client's user                        | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal.         |
-| Calls hang or time out                   | ARM is throttling (HTTP 429) — currently surfaced as a generic error                   | Retry after 30–60 s. Automatic backoff is on the Roadmap (Stage 4).                                                                                          |
-| `404` for a pipeline that exists         | Wrong factory in `ADF_FACTORY_RESOURCE_ID`                                             | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match).                                                        |
+| Symptom                                        | Likely cause                                                                           | Fix                                                                                                                                                  |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Missing required env vars` on startup         | `ADF_FACTORY_RESOURCE_ID` or `AZURE_TENANT_ID` not set in the MCP client's `env` block | Add them to the client config and restart the client.                                                                                                |
+| Tool call returns `403` from ARM               | Your account lacks RBAC on the factory                                                 | Ask the resource owner to grant at least **Reader** on the Data Factory resource (Portal → ADF → Access control (IAM)).                              |
+| Tool call returns `401` / token errors         | Conditional Access or MFA blocked the silent token                                     | Sign out of Azure CLI / browser sessions, then re-trigger any tool to force a fresh interactive sign-in.                                             |
+| Browser tab never opens on first call          | Running over SSH / inside WSL / on a headless host                                     | Switch to `ADF_AUTH_MODE=device-code` and read the code/URL from the MCP server's stderr log.                                                        |
+| `Invalid ADF_AUTH_MODE`                        | Typo in the mode name                                                                  | Use one of: `interactive`, `device-code`, `cli`, `service-principal`, `managed-identity`, `default`.                                                 |
+| `ADF_AUTH_MODE=service-principal requires ...` | Missing `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, or `AZURE_CLIENT_SECRET`                 | Set all three in the MCP client's `env` block.                                                                                                       |
+| MCP client says "server failed to start"       | Wrong path in `args`, or Node not on PATH for the client's user                        | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal. |
+| Calls hang or time out                         | ARM is throttling (HTTP 429) — currently surfaced as a generic error                   | Retry after 30–60 s. Automatic backoff is on the Roadmap (Stage 4).                                                                                  |
+| `404` for a pipeline that exists               | Wrong factory in `ADF_FACTORY_RESOURCE_ID`                                             | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match).                                                |
 
 For everything else, check the project [issues](https://github.com/user-vik/adf-mcp-server/issues).
 

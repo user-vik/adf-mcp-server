@@ -67,14 +67,16 @@ caller identity (from the token), and target resource.
       from the failed activity.
 - [x] `start_trigger` / `stop_trigger` — toggle trigger state.
 
-## Stage 6 — Destructive writes with plan/apply confirmation
+## Stage 6 — Destructive writes with plan/apply confirmation _(done — shipped in 0.4.0)_
 
 Gated behind both `ADF_MCP_MODE=write` and `ADF_MCP_ALLOW_DELETE=true`.
 
-- `create_or_update_pipeline` / `_trigger` / `_linked_service` / `_dataset`.
-- `delete_pipeline` / `_trigger` / `_linked_service` / `_dataset`.
-- Two-step plan/apply: first call returns a diff plus a confirmation token;
-  apply requires the token. Prevents an LLM from one-shot deleting things.
+- [x] `create_or_update_pipeline` / `_trigger` / `_linked_service` / `_dataset`.
+- [x] `delete_pipeline` / `_trigger` / `_linked_service` / `_dataset`.
+- [x] Two-step plan/apply: first call returns a diff plus a confirmation token;
+      apply requires the token. Prevents an LLM from one-shot deleting things.
+- [x] ETag concurrency via `If-Match` so a resource modified between plan and
+      apply is rejected with HTTP 412.
 
 ## Stage 7 — Packaging & distribution
 

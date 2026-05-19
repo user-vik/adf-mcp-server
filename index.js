@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -100,9 +101,10 @@ async function getToken() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Calls an arbitrary ARM path (already including /subscriptions/...).
-// `extraQuery` lets callers add query parameters beyond api-version (used by
-// rerun / cancel endpoints). Retries on HTTP 429, honoring Retry-After.
-async function armAt(method, fullArmPath, body, extraQuery = {}) {
+// `extraQuery` adds query parameters beyond api-version (rerun / cancel).
+// `extraHeaders` adds request headers (used for If-Match ETag concurrency
+// control on mutating ops). Retries on HTTP 429, honoring Retry-After.
+async function armAt(method, fullArmPath, body, extraQuery = {}, extraHeaders = {}) {
   const token = await getToken();
   const url = new URL(`${ARM_BASE}${fullArmPath}`);
   url.searchParams.set("api-version", API_VERSION);
@@ -115,6 +117,7 @@ async function armAt(method, fullArmPath, body, extraQuery = {}) {
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
+        ...extraHeaders,
       },
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -131,15 +134,28 @@ async function armAt(method, fullArmPath, body, extraQuery = {}) {
     }
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`ADF ${method} ${fullArmPath} -> ${res.status}: ${text}`);
+      const err = new Error(`ADF ${method} ${fullArmPath} -> ${res.status}: ${text}`);
+      err.status = res.status;
+      throw err;
     }
     return text ? JSON.parse(text) : null;
   }
 }
 
 // Factory-scoped convenience wrapper. `path` is relative to the factory ARM ID.
-async function arm(method, path, body, extraQuery) {
-  return armAt(method, `${FACTORY_ID}${path}`, body, extraQuery);
+async function arm(method, path, body, extraQuery, extraHeaders) {
+  return armAt(method, `${FACTORY_ID}${path}`, body, extraQuery, extraHeaders);
+}
+
+// GET a factory resource and return null on 404 instead of throwing.
+// Used by mutating tools' plan step to detect create vs update.
+async function fetchExistingOrNull(path) {
+  try {
+    return await arm("GET", path);
+  } catch (e) {
+    if (e?.status === 404) return null;
+    throw e;
+  }
 }
 
 function ok(obj) {
@@ -227,11 +243,129 @@ function writeTool(toolName, getTarget, handler) {
 }
 
 const WRITE_ENABLED = (process.env.ADF_MCP_MODE ?? "read").toLowerCase() === "write";
+const DESTRUCTIVE_REQUESTED = process.env.ADF_MCP_ALLOW_DELETE === "true";
+const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
 if (WRITE_ENABLED) {
   console.error("[adf-mcp] write mode enabled — pipeline run + trigger control tools are exposed");
 }
+if (DESTRUCTIVE_ENABLED) {
+  console.error(
+    "[adf-mcp] destructive mode enabled — create_or_update_* and delete_* tools are exposed (plan/apply confirmation required)",
+  );
+} else if (DESTRUCTIVE_REQUESTED && !WRITE_ENABLED) {
+  console.error(
+    "[adf-mcp] WARNING: ADF_MCP_ALLOW_DELETE=true ignored because ADF_MCP_MODE is not 'write'.",
+  );
+}
 
-const server = new McpServer({ name: "adf-mcp", version: "0.3.0" });
+// ─── Plan/apply token store for destructive mutations ───────────────────────
+// Tokens bind a specific (tool, target, payload) to a confirmation call.
+// The plan step returns a token; the apply step (dry_run=false) must echo it
+// back. Tokens expire after PLAN_TTL_MS. Captured ETag enforces optimistic
+// concurrency on the apply via If-Match.
+const PLAN_TTL_MS = 10 * 60 * 1000;
+const pendingPlans = new Map();
+
+function hashPayload(payload) {
+  return JSON.stringify(payload ?? null);
+}
+
+function createPlanToken(toolName, target, payload, etag) {
+  const token = crypto.randomUUID();
+  const expiresAt = Date.now() + PLAN_TTL_MS;
+  pendingPlans.set(token, {
+    toolName,
+    target,
+    payloadHash: hashPayload(payload),
+    etag,
+    expiresAt,
+  });
+  return { token, expiresAt: new Date(expiresAt).toISOString() };
+}
+
+function consumePlanToken(token, toolName, target, payload) {
+  const entry = pendingPlans.get(token);
+  if (!entry) {
+    throw new Error(
+      `Invalid confirm_token. Tokens expire after ${PLAN_TTL_MS / 60_000}m; request a new plan with dry_run=true.`,
+    );
+  }
+  if (Date.now() > entry.expiresAt) {
+    pendingPlans.delete(token);
+    throw new Error(`confirm_token expired. Request a new plan with dry_run=true.`);
+  }
+  if (
+    entry.toolName !== toolName ||
+    entry.target !== target ||
+    entry.payloadHash !== hashPayload(payload)
+  ) {
+    throw new Error(
+      `confirm_token does not match the current call. If the payload changed since the plan, request a new plan.`,
+    );
+  }
+  pendingPlans.delete(token);
+  return entry;
+}
+
+// Sweep expired plans every minute. .unref() so the timer doesn't keep the
+// Node event loop alive at shutdown.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of pendingPlans) {
+    if (entry.expiresAt < now) pendingPlans.delete(token);
+  }
+}, 60_000).unref();
+
+// Shared plan/apply executor used by every destructive tool. Splits the call
+// into "compute plan + issue token" (dry_run, default) vs. "consume token +
+// apply with If-Match" (dry_run=false).
+async function executePlanApply({
+  toolName,
+  action,
+  target,
+  payload,
+  dry_run,
+  confirm_token,
+  fetchBefore,
+  buildAfter,
+  apply,
+}) {
+  const isDryRun = dry_run !== false;
+  if (isDryRun) {
+    const before = await fetchBefore();
+    const etag = before?.properties?.etag ?? before?.etag;
+    const { token, expiresAt } = createPlanToken(toolName, target, payload, etag);
+    return ok({
+      plan_type: "DRY_RUN",
+      action,
+      target,
+      before: before ?? null,
+      after: buildAfter(),
+      confirm_token: token,
+      expires_at: expiresAt,
+      hint: `To apply, call ${toolName} again with dry_run=false and confirm_token="${token}".`,
+    });
+  }
+  if (!confirm_token) {
+    throw new Error(
+      "confirm_token is required when dry_run=false. Run with dry_run=true first to generate a plan.",
+    );
+  }
+  const entry = consumePlanToken(confirm_token, toolName, target, payload);
+  try {
+    const result = await apply(entry.etag);
+    return ok({ plan_type: "APPLIED", action, target, result });
+  } catch (e) {
+    if (e?.status === 412) {
+      throw new Error(
+        `Resource ${target} changed since the plan was computed (HTTP 412 Precondition Failed). Request a new plan with dry_run=true.`,
+      );
+    }
+    throw e;
+  }
+}
+
+const server = new McpServer({ name: "adf-mcp", version: "0.4.0" });
 
 server.registerTool(
   "list_pipelines",
@@ -621,6 +755,311 @@ if (WRITE_ENABLED) {
       async ({ name }) => {
         await arm("POST", `/triggers/${encodeURIComponent(name)}/stop`);
         return ok({ stopped: true, trigger: name });
+      },
+    ),
+  );
+}
+
+// ─── Destructive tools — registered only when ──────────────────────────────
+//      ADF_MCP_MODE=write AND ADF_MCP_ALLOW_DELETE=true
+// Each tool uses the dry_run/confirm_token plan-apply pattern. The plan step
+// fetches the existing resource (captures its ETag), shows before/after, and
+// returns a single-use token. The apply step (dry_run=false) requires that
+// token and uses If-Match for optimistic concurrency.
+
+if (DESTRUCTIVE_ENABLED) {
+  const planApplyInputs = {
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe("If true (default), return the planned change without applying."),
+    confirm_token: z
+      .string()
+      .optional()
+      .describe("Token returned by a recent dry_run. Required when dry_run=false."),
+  };
+
+  // ── pipelines ──
+  server.registerTool(
+    "create_or_update_pipeline",
+    {
+      description:
+        "Create a new pipeline or overwrite an existing one. Two-step: first call (dry_run=true, default) returns a diff and a confirm_token; second call (dry_run=false with that token) applies the change.",
+      inputSchema: {
+        name: z.string().describe("The pipeline name"),
+        definition: z
+          .record(z.unknown())
+          .describe(
+            "The pipeline body as the ADF REST API expects it, typically { properties: { activities: [...], parameters: {...} } }.",
+          ),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "create_or_update_pipeline",
+      ({ name }) => `pipeline=${name}`,
+      async ({ name, definition, dry_run, confirm_token }) => {
+        const path = `/pipelines/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "create_or_update_pipeline",
+          action: "create_or_update",
+          target: `pipeline=${name}`,
+          payload: { definition },
+          dry_run,
+          confirm_token,
+          fetchBefore: () => fetchExistingOrNull(path),
+          buildAfter: () => definition,
+          apply: (etag) =>
+            arm("PUT", path, definition, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "delete_pipeline",
+    {
+      description:
+        "Delete a pipeline. Two-step: first call (dry_run=true, default) returns the resource that will be removed and a confirm_token; second call (dry_run=false with that token) deletes it.",
+      inputSchema: {
+        name: z.string().describe("The pipeline name"),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "delete_pipeline",
+      ({ name }) => `pipeline=${name}`,
+      async ({ name, dry_run, confirm_token }) => {
+        const path = `/pipelines/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "delete_pipeline",
+          action: "delete",
+          target: `pipeline=${name}`,
+          payload: { name },
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => {
+            const r = await fetchExistingOrNull(path);
+            if (!r) throw new Error(`pipeline "${name}" does not exist; nothing to delete.`);
+            return r;
+          },
+          buildAfter: () => null,
+          apply: (etag) =>
+            arm("DELETE", path, undefined, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  // ── triggers ──
+  server.registerTool(
+    "create_or_update_trigger",
+    {
+      description:
+        "Create or overwrite a trigger. Same dry_run/confirm_token pattern as create_or_update_pipeline. NOTE: a newly-created trigger is in Stopped state — call start_trigger to activate it.",
+      inputSchema: {
+        name: z.string().describe("The trigger name"),
+        definition: z
+          .record(z.unknown())
+          .describe("The trigger body, typically { properties: { type: '...', ... } }."),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "create_or_update_trigger",
+      ({ name }) => `trigger=${name}`,
+      async ({ name, definition, dry_run, confirm_token }) => {
+        const path = `/triggers/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "create_or_update_trigger",
+          action: "create_or_update",
+          target: `trigger=${name}`,
+          payload: { definition },
+          dry_run,
+          confirm_token,
+          fetchBefore: () => fetchExistingOrNull(path),
+          buildAfter: () => definition,
+          apply: (etag) =>
+            arm("PUT", path, definition, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "delete_trigger",
+    {
+      description:
+        "Delete a trigger. Must be stopped first (use stop_trigger). Same dry_run/confirm_token pattern as delete_pipeline.",
+      inputSchema: {
+        name: z.string().describe("The trigger name"),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "delete_trigger",
+      ({ name }) => `trigger=${name}`,
+      async ({ name, dry_run, confirm_token }) => {
+        const path = `/triggers/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "delete_trigger",
+          action: "delete",
+          target: `trigger=${name}`,
+          payload: { name },
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => {
+            const r = await fetchExistingOrNull(path);
+            if (!r) throw new Error(`trigger "${name}" does not exist; nothing to delete.`);
+            return r;
+          },
+          buildAfter: () => null,
+          apply: (etag) =>
+            arm("DELETE", path, undefined, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  // ── linked services ──
+  server.registerTool(
+    "create_or_update_linked_service",
+    {
+      description:
+        "Create or overwrite a linked service (database / storage connection). Same dry_run/confirm_token pattern. Secrets in connection strings should be referenced from Key Vault, not inlined.",
+      inputSchema: {
+        name: z.string().describe("The linked service name"),
+        definition: z
+          .record(z.unknown())
+          .describe(
+            "The linked service body, typically { properties: { type: '...', typeProperties: {...} } }.",
+          ),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "create_or_update_linked_service",
+      ({ name }) => `linkedservice=${name}`,
+      async ({ name, definition, dry_run, confirm_token }) => {
+        const path = `/linkedservices/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "create_or_update_linked_service",
+          action: "create_or_update",
+          target: `linkedservice=${name}`,
+          payload: { definition },
+          dry_run,
+          confirm_token,
+          fetchBefore: () => fetchExistingOrNull(path),
+          buildAfter: () => definition,
+          apply: (etag) =>
+            arm("PUT", path, definition, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "delete_linked_service",
+    {
+      description:
+        "Delete a linked service. Any datasets that reference it will start failing — check with list_datasets first. Same dry_run/confirm_token pattern.",
+      inputSchema: {
+        name: z.string().describe("The linked service name"),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "delete_linked_service",
+      ({ name }) => `linkedservice=${name}`,
+      async ({ name, dry_run, confirm_token }) => {
+        const path = `/linkedservices/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "delete_linked_service",
+          action: "delete",
+          target: `linkedservice=${name}`,
+          payload: { name },
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => {
+            const r = await fetchExistingOrNull(path);
+            if (!r) throw new Error(`linked service "${name}" does not exist; nothing to delete.`);
+            return r;
+          },
+          buildAfter: () => null,
+          apply: (etag) =>
+            arm("DELETE", path, undefined, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  // ── datasets ──
+  server.registerTool(
+    "create_or_update_dataset",
+    {
+      description: "Create or overwrite a dataset. Same dry_run/confirm_token pattern.",
+      inputSchema: {
+        name: z.string().describe("The dataset name"),
+        definition: z
+          .record(z.unknown())
+          .describe(
+            "The dataset body, typically { properties: { type: '...', linkedServiceName: {...} } }.",
+          ),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "create_or_update_dataset",
+      ({ name }) => `dataset=${name}`,
+      async ({ name, definition, dry_run, confirm_token }) => {
+        const path = `/datasets/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "create_or_update_dataset",
+          action: "create_or_update",
+          target: `dataset=${name}`,
+          payload: { definition },
+          dry_run,
+          confirm_token,
+          fetchBefore: () => fetchExistingOrNull(path),
+          buildAfter: () => definition,
+          apply: (etag) =>
+            arm("PUT", path, definition, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "delete_dataset",
+    {
+      description:
+        "Delete a dataset. Any pipelines that reference it will start failing — check with list_pipelines first. Same dry_run/confirm_token pattern.",
+      inputSchema: {
+        name: z.string().describe("The dataset name"),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "delete_dataset",
+      ({ name }) => `dataset=${name}`,
+      async ({ name, dry_run, confirm_token }) => {
+        const path = `/datasets/${encodeURIComponent(name)}`;
+        return executePlanApply({
+          toolName: "delete_dataset",
+          action: "delete",
+          target: `dataset=${name}`,
+          payload: { name },
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => {
+            const r = await fetchExistingOrNull(path);
+            if (!r) throw new Error(`dataset "${name}" does not exist; nothing to delete.`);
+            return r;
+          },
+          buildAfter: () => null,
+          apply: (etag) =>
+            arm("DELETE", path, undefined, undefined, etag ? { "If-Match": etag } : {}),
+        });
       },
     ),
   );

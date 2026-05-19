@@ -1,6 +1,6 @@
 # adf-mcp-server
 
-MCP server for classic Azure Data Factory (V2) pipeline troubleshooting and operations. Exposes ARM tools for pipelines, pipeline runs, activity runs, triggers, linked services, datasets, and integration runtimes over stdio. Supports six Entra auth modes — interactive browser, device code, Azure CLI session, service principal, managed identity, or auto-detect. Read-only by default; write mode (run/cancel/start/stop) is opt-in via `ADF_MCP_MODE=write`.
+MCP server for classic Azure Data Factory (V2) pipeline troubleshooting and operations. Exposes ARM tools for pipelines, pipeline runs, activity runs, triggers, linked services, datasets, and integration runtimes over stdio. Supports six Entra auth modes — interactive browser, device code, Azure CLI session, service principal, managed identity, or auto-detect. **Read-only by default**, with two opt-in tiers: `ADF_MCP_MODE=write` for runtime ops (run/cancel/start/stop), plus `ADF_MCP_ALLOW_DELETE=true` for definition-changing ops (`create_or_update_*` and `delete_*`) gated by a plan/apply confirmation pattern.
 
 ## What it does
 
@@ -29,6 +29,19 @@ Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop,
 | `start_trigger`       | Start a trigger so it begins firing on its schedule.                                            |
 | `stop_trigger`        | Stop a trigger so it stops firing.                                                              |
 
+**Destructive tools** — only registered when `ADF_MCP_MODE=write` AND `ADF_MCP_ALLOW_DELETE=true`. Every call uses a two-step plan/apply confirmation pattern (see **Destructive mode** below):
+
+| Tool                              | Purpose                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `create_or_update_pipeline`       | Create a new pipeline or overwrite an existing one.                     |
+| `create_or_update_trigger`        | Create or overwrite a trigger. New triggers start in Stopped state.     |
+| `create_or_update_linked_service` | Create or overwrite a linked service (database / storage connection).   |
+| `create_or_update_dataset`        | Create or overwrite a dataset.                                          |
+| `delete_pipeline`                 | Delete a pipeline.                                                      |
+| `delete_trigger`                  | Delete a trigger (must be stopped first via `stop_trigger`).            |
+| `delete_linked_service`           | Delete a linked service. Datasets that reference it will start failing. |
+| `delete_dataset`                  | Delete a dataset. Pipelines that reference it will start failing.       |
+
 ## Prerequisites
 
 - **Node.js >= 20** on PATH (`node -v` to verify). The Node MSI install may be UAC-blocked on locked-down corp Windows boxes — ask IT if needed.
@@ -53,6 +66,7 @@ The server reads everything from environment variables — typically set inside 
 | `ADF_FACTORY_RESOURCE_ID` | always                                                  | Full ARM resource ID, e.g. `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DataFactory/factories/<factory>`                           |
 | `ADF_AUTH_MODE`           | no                                                      | Auth credential to use. Defaults to `interactive`. See **Authentication modes** below.                                                              |
 | `ADF_MCP_MODE`            | no                                                      | `read` (default) or `write`. `write` registers run/cancel/start/stop tools. See **Write mode** below.                                               |
+| `ADF_MCP_ALLOW_DELETE`    | no                                                      | When `true` AND `ADF_MCP_MODE=write`, also registers the 8 `create_or_update_*` and `delete_*` tools. See **Destructive mode** below.               |
 | `AZURE_TENANT_ID`         | for `interactive` / `device-code` / `service-principal` | Entra tenant ID.                                                                                                                                    |
 | `AZURE_CLIENT_ID`         | for `service-principal`                                 | Optional for `interactive`/`device-code` (defaults to Azure CLI public client). For `managed-identity`, set only when targeting a user-assigned MI. |
 | `AZURE_CLIENT_SECRET`     | for `service-principal`                                 | Treat as a secret. Never commit.                                                                                                                    |
@@ -115,7 +129,7 @@ To enable mutations, set `ADF_MCP_MODE=write` in the MCP client's `env` block. T
 
 ### What it does NOT unlock
 
-Destructive operations — `delete_*`, `create_or_update_*` — are still gated separately (Roadmap → Stage 6, behind an additional `ADF_MCP_ALLOW_DELETE=true` flag with two-step plan/apply confirmation).
+Definition-changing operations — `create_or_update_*` and `delete_*` — are gated separately behind `ADF_MCP_ALLOW_DELETE=true` and use a two-step plan/apply confirmation. See **Destructive mode** below.
 
 ### RBAC
 
@@ -136,6 +150,51 @@ The caller is parsed from the `upn` / `preferred_username` / `appid` / `oid` cla
 
 `ADF_MCP_MODE=write` + `ADF_AUTH_MODE=service-principal`. The SP gets exactly the RBAC it needs, the audit log identifies it consistently, and individual users don't need factory-Contributor on their personal accounts.
 
+## Destructive mode
+
+Setting `ADF_MCP_ALLOW_DELETE=true` in addition to `ADF_MCP_MODE=write` registers the 8 tools that mutate the factory's definition (`create_or_update_*` for pipelines, triggers, linked services, datasets, plus their `delete_*` counterparts). The server logs `[adf-mcp] destructive mode enabled` at startup so it's visible in the MCP server log. Setting `ADF_MCP_ALLOW_DELETE=true` without `ADF_MCP_MODE=write` logs a warning and is ignored.
+
+### Why "destructive" covers create_or_update too
+
+`create_or_update_*` can silently overwrite an existing resource — the LLM might not realize it exists. Bundling it with `delete_*` under the same flag keeps "anything that changes the factory's definition" behind a single, conscious opt-in.
+
+### Plan/apply confirmation
+
+Every destructive tool uses a two-step pattern that forces the LLM (and the human reading the chat) to look at the diff before applying it.
+
+1. **Plan step** — the LLM calls the tool with `dry_run: true` (the default). The server fetches the existing resource, returns a `before` / `after` diff, and issues a one-time `confirm_token` with a 10-minute TTL.
+
+   ```jsonc
+   {
+     "plan_type": "DRY_RUN",
+     "action": "create_or_update",
+     "target": "pipeline=ETL_Daily",
+     "before": {
+       "properties": {
+         /* current pipeline */
+       },
+     },
+     "after": {
+       "properties": {
+         /* proposed pipeline */
+       },
+     },
+     "confirm_token": "8c1f...e0a3",
+     "expires_at": "2026-05-19T15:52:00.000Z",
+     "hint": "To apply, call create_or_update_pipeline again with dry_run=false and confirm_token=\"8c1f...e0a3\".",
+   }
+   ```
+
+2. **Apply step** — the LLM calls the same tool again with `dry_run: false` and the `confirm_token` from step 1. The token is single-use, bound to the exact `(tool, target, payload)` triple, and tied to the resource's ETag at plan time. If anything changed since the plan was computed, ARM returns HTTP 412 Precondition Failed and the server surfaces "Resource changed since the plan; request a new plan."
+
+### Why tokens, not just `dry_run=false`?
+
+Without the token, an LLM could skip the plan step entirely. Requiring a token means the LLM must have seen a plan in its own context (and surfaced it to you in the chat) before it can apply. The token store is in-memory; restarting the MCP server invalidates all pending plans.
+
+### RBAC for destructive mode
+
+The identity needs **Data Factory Contributor** on the factory (same role as write mode — no additional permissions, because ADF doesn't model "can create but not delete" separately at the RBAC level).
+
 ## Run standalone (for debugging)
 
 ```sh
@@ -146,20 +205,23 @@ The server speaks MCP over stdio, so running it directly will just block waiting
 
 ## Troubleshooting
 
-| Symptom                                        | Likely cause                                                                           | Fix                                                                                                                                                    |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Missing required env vars` on startup         | `ADF_FACTORY_RESOURCE_ID` or `AZURE_TENANT_ID` not set in the MCP client's `env` block | Add them to the client config and restart the client.                                                                                                  |
-| Tool call returns `403` from ARM               | Your account lacks RBAC on the factory                                                 | Ask the resource owner to grant at least **Reader** on the Data Factory resource (Portal → ADF → Access control (IAM)).                                |
-| Tool call returns `401` / token errors         | Conditional Access or MFA blocked the silent token                                     | Sign out of Azure CLI / browser sessions, then re-trigger any tool to force a fresh interactive sign-in.                                               |
-| Browser tab never opens on first call          | Running over SSH / inside WSL / on a headless host                                     | Switch to `ADF_AUTH_MODE=device-code` and read the code/URL from the MCP server's stderr log.                                                          |
-| `Invalid ADF_AUTH_MODE`                        | Typo in the mode name                                                                  | Use one of: `interactive`, `device-code`, `cli`, `service-principal`, `managed-identity`, `default`.                                                   |
-| `ADF_AUTH_MODE=service-principal requires ...` | Missing `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, or `AZURE_CLIENT_SECRET`                 | Set all three in the MCP client's `env` block.                                                                                                         |
-| MCP client says "server failed to start"       | Wrong path in `args`, or Node not on PATH for the client's user                        | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal.   |
-| Calls hang or time out                         | ARM is throttling (HTTP 429) and the server is auto-retrying with backoff              | Check the MCP server's stderr log — each retry is logged. Up to 3 retries honoring `Retry-After`; on exhaustion, the call fails with the original 429. |
-| Activity output is `{ _truncated: true, ... }` | Default 4 KB truncation kicked in to protect the LLM context window                    | Pass `full=true` to `query_activity_runs` for the untruncated payload.                                                                                 |
-| LLM says "no tool to start a run / cancel"     | Server is in read-only mode (default)                                                  | Set `ADF_MCP_MODE=write` in the MCP client's `env` block and restart the client.                                                                       |
-| Write tool returns `403 Authorization failed`  | The identity has Reader but not Contributor on the factory                             | Grant **Data Factory Contributor** (or a narrower custom role with the relevant pipelineruns/triggers actions) to the user / SP / MI.                  |
-| `404` for a pipeline that exists               | Wrong factory in `ADF_FACTORY_RESOURCE_ID`                                             | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match).                                                  |
+| Symptom                                              | Likely cause                                                                           | Fix                                                                                                                                                    |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Missing required env vars` on startup               | `ADF_FACTORY_RESOURCE_ID` or `AZURE_TENANT_ID` not set in the MCP client's `env` block | Add them to the client config and restart the client.                                                                                                  |
+| Tool call returns `403` from ARM                     | Your account lacks RBAC on the factory                                                 | Ask the resource owner to grant at least **Reader** on the Data Factory resource (Portal → ADF → Access control (IAM)).                                |
+| Tool call returns `401` / token errors               | Conditional Access or MFA blocked the silent token                                     | Sign out of Azure CLI / browser sessions, then re-trigger any tool to force a fresh interactive sign-in.                                               |
+| Browser tab never opens on first call                | Running over SSH / inside WSL / on a headless host                                     | Switch to `ADF_AUTH_MODE=device-code` and read the code/URL from the MCP server's stderr log.                                                          |
+| `Invalid ADF_AUTH_MODE`                              | Typo in the mode name                                                                  | Use one of: `interactive`, `device-code`, `cli`, `service-principal`, `managed-identity`, `default`.                                                   |
+| `ADF_AUTH_MODE=service-principal requires ...`       | Missing `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, or `AZURE_CLIENT_SECRET`                 | Set all three in the MCP client's `env` block.                                                                                                         |
+| MCP client says "server failed to start"             | Wrong path in `args`, or Node not on PATH for the client's user                        | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal.   |
+| Calls hang or time out                               | ARM is throttling (HTTP 429) and the server is auto-retrying with backoff              | Check the MCP server's stderr log — each retry is logged. Up to 3 retries honoring `Retry-After`; on exhaustion, the call fails with the original 429. |
+| Activity output is `{ _truncated: true, ... }`       | Default 4 KB truncation kicked in to protect the LLM context window                    | Pass `full=true` to `query_activity_runs` for the untruncated payload.                                                                                 |
+| LLM says "no tool to start a run / cancel"           | Server is in read-only mode (default)                                                  | Set `ADF_MCP_MODE=write` in the MCP client's `env` block and restart the client.                                                                       |
+| Write tool returns `403 Authorization failed`        | The identity has Reader but not Contributor on the factory                             | Grant **Data Factory Contributor** (or a narrower custom role with the relevant pipelineruns/triggers actions) to the user / SP / MI.                  |
+| Apply call returns "Resource changed since the plan" | Someone (or something) modified the resource between your plan and apply step          | Re-run with `dry_run=true` to fetch a fresh plan, then apply the new `confirm_token`.                                                                  |
+| Apply call returns "Invalid confirm_token"           | Token expired (10-min TTL), already used, or server restarted                          | Re-run with `dry_run=true` to get a new token.                                                                                                         |
+| Apply call returns "confirm_token does not match"    | The payload changed between plan and apply (e.g. the LLM edited the definition)        | Re-run the plan step with the current payload to get a token bound to it.                                                                              |
+| `404` for a pipeline that exists                     | Wrong factory in `ADF_FACTORY_RESOURCE_ID`                                             | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match).                                                  |
 
 For everything else, check the project [issues](https://github.com/user-vik/adf-mcp-server/issues).
 

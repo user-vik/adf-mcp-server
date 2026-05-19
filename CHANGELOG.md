@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0]
+
+### Added
+- `ADF_MCP_ALLOW_DELETE=true` (requires `ADF_MCP_MODE=write`) enables 8 new
+  destructive tools — 4 `create_or_update_*` and 4 `delete_*` for pipelines,
+  triggers, linked services, and datasets. Off by default. Setting the flag
+  without write mode logs a warning and is ignored.
+- **Plan/apply confirmation pattern** for every destructive tool. First call
+  (`dry_run: true`, default) returns a before/after diff plus a single-use
+  `confirm_token` with a 10-minute TTL. Second call (`dry_run: false` +
+  matching `confirm_token`) applies the change.
+- **Optimistic concurrency** via ETag captured at plan time and passed as
+  `If-Match` on apply. If the resource changed between plan and apply, ARM
+  returns 412 and the server surfaces "Resource changed since the plan;
+  request a new plan."
+- Token-store hygiene: tokens are bound to `(tool, target, payload-hash)`,
+  single-use, expire after 10 minutes, and are swept every minute.
+- README "Destructive mode" section covering the plan/apply rationale, the
+  ETag concurrency story, and why `create_or_update_*` is bundled with
+  `delete_*` under the same flag.
+
+### Changed
+- `armAt()` now accepts `extraHeaders` so callers can pass `If-Match`.
+- Errors from ARM responses now expose `.status` so downstream code (e.g.
+  `fetchExistingOrNull`, 412 detection in apply) can branch on HTTP status.
+
 ## [0.3.0]
 
 ### Added
@@ -91,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive browser authentication via `@azure/identity`.
 - MIT license and `package.json` metadata for distribution.
 
-[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/user-vik/adf-mcp-server/releases/tag/v0.1.0

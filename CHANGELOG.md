@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+- Optional **write mode** opt-in via `ADF_MCP_MODE=write`. When unset (default)
+  the server is read-only — write tools are not registered at all, so an LLM
+  cannot call them regardless of prompt.
+- Five write tools (registered only in write mode):
+  - `create_pipeline_run` — kick off a new run, optionally with parameters.
+  - `cancel_pipeline_run` — cancel an in-progress run; child runs too by default.
+  - `rerun_pipeline_run` — re-execute a previous run; defaults to resuming from
+    the failed activity.
+  - `start_trigger` / `stop_trigger` — toggle a trigger's runtime state.
+- Audit logging to stderr for every write tool call. Each invocation emits
+  ATTEMPT + (SUCCESS | FAILURE) lines with timestamp, target, and caller
+  identity parsed from the Entra token (`upn`/`preferred_username`/`appid`/`oid`).
+- Startup log line when write mode is enabled, so the operator can see in the
+  MCP server log whether mutations are possible.
+- README "Write mode" section covering RBAC requirements, audit log format,
+  recommended SP pairing, and the separation from destructive ops (Stage 6).
+
+### Changed
+- `armAt()` now builds URLs via the `URL` constructor and accepts an
+  `extraQuery` argument, enabling endpoints that need query params beyond
+  `api-version` (rerun's `referencePipelineRunId`, cancel's `isRecursive`).
+
 ## [0.2.0]
 
 ### Added
@@ -66,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive browser authentication via `@azure/identity`.
 - MIT license and `package.json` metadata for distribution.
 
-[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/user-vik/adf-mcp-server/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/user-vik/adf-mcp-server/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/user-vik/adf-mcp-server/releases/tag/v0.1.0

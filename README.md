@@ -1,10 +1,10 @@
 # adf-mcp-server
 
-MCP server for classic Azure Data Factory (V2) pipeline troubleshooting. Exposes ARM read tools for pipelines, pipeline runs, activity runs, and triggers over stdio. Supports six Entra auth modes — interactive browser, device code, Azure CLI session, service principal, managed identity, or auto-detect.
+MCP server for classic Azure Data Factory (V2) pipeline troubleshooting and operations. Exposes ARM tools for pipelines, pipeline runs, activity runs, triggers, linked services, datasets, and integration runtimes over stdio. Supports six Entra auth modes — interactive browser, device code, Azure CLI session, service principal, managed identity, or auto-detect. Read-only by default; write mode (run/cancel/start/stop) is opt-in via `ADF_MCP_MODE=write`.
 
 ## What it does
 
-Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop, Cursor, etc.) can read the state of a Data Factory and help you investigate failures. Read-only — it cannot publish pipelines, start triggers, or kick off Debug runs.
+Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop, Cursor, etc.) can investigate, run, and control a Data Factory. **Read-only by default** — write tools (kicking off pipeline runs, cancelling them, toggling triggers) are registered only when the operator sets `ADF_MCP_MODE=write` in the MCP client config. See **Write mode** below.
 
 | Tool                        | Purpose                                                                                                |
 | --------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -18,6 +18,16 @@ Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop,
 | `list_datasets`             | Datasets and the linked service each one belongs to                                                    |
 | `list_integration_runtimes` | Integration runtimes and their state — useful for spotting offline self-hosted IRs                     |
 | `list_factories`            | All ADF v2 instances in the current subscription — discover other factories without their full ARM IDs |
+
+**Write tools** — only registered when `ADF_MCP_MODE=write`:
+
+| Tool                  | Purpose                                                                                         |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `create_pipeline_run` | Kick off a new run of a pipeline (optionally with parameters). Returns the new `runId`.         |
+| `cancel_pipeline_run` | Cancel an in-progress pipeline run. Cancels child runs too by default.                          |
+| `rerun_pipeline_run`  | Re-execute a previous run. Defaults to resuming from the failed activity (the common workflow). |
+| `start_trigger`       | Start a trigger so it begins firing on its schedule.                                            |
+| `stop_trigger`        | Stop a trigger so it stops firing.                                                              |
 
 ## Prerequisites
 
@@ -42,6 +52,7 @@ The server reads everything from environment variables — typically set inside 
 | ------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ADF_FACTORY_RESOURCE_ID` | always                                                  | Full ARM resource ID, e.g. `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DataFactory/factories/<factory>`                           |
 | `ADF_AUTH_MODE`           | no                                                      | Auth credential to use. Defaults to `interactive`. See **Authentication modes** below.                                                              |
+| `ADF_MCP_MODE`            | no                                                      | `read` (default) or `write`. `write` registers run/cancel/start/stop tools. See **Write mode** below.                                               |
 | `AZURE_TENANT_ID`         | for `interactive` / `device-code` / `service-principal` | Entra tenant ID.                                                                                                                                    |
 | `AZURE_CLIENT_ID`         | for `service-principal`                                 | Optional for `interactive`/`device-code` (defaults to Azure CLI public client). For `managed-identity`, set only when targeting a user-assigned MI. |
 | `AZURE_CLIENT_SECRET`     | for `service-principal`                                 | Treat as a secret. Never commit.                                                                                                                    |
@@ -92,6 +103,39 @@ For all user-flow modes (`interactive`, `device-code`, `cli`), the effective ARM
 - **`managed-identity`**: omit `AZURE_CLIENT_ID` for a system-assigned MI; set it to the MI's client ID for a user-assigned MI.
 - **`default`**: opaque when something fails. If `DefaultAzureCredential` errors with "no credential was found", switch to a specific mode to see which one is actually failing.
 
+## Write mode
+
+By default the server is **read-only** — no MCP tool it exposes can mutate the factory. An LLM literally cannot call write operations because they aren't registered.
+
+To enable mutations, set `ADF_MCP_MODE=write` in the MCP client's `env` block. The server logs `[adf-mcp] write mode enabled — pipeline run + trigger control tools are exposed` at startup so it's visible in the server log.
+
+### What write mode unlocks
+
+`create_pipeline_run`, `cancel_pipeline_run`, `rerun_pipeline_run`, `start_trigger`, `stop_trigger`. See the tool table above.
+
+### What it does NOT unlock
+
+Destructive operations — `delete_*`, `create_or_update_*` — are still gated separately (Roadmap → Stage 6, behind an additional `ADF_MCP_ALLOW_DELETE=true` flag with two-step plan/apply confirmation).
+
+### RBAC
+
+`Reader` is no longer enough. Grant the identity used by `ADF_AUTH_MODE` at least **Data Factory Contributor** on the factory, or a narrower custom role that includes the action `Microsoft.DataFactory/factories/pipelineruns/*` and the trigger start/stop actions.
+
+### Audit log
+
+Every write call is logged to **stderr** with a line like:
+
+```
+[adf-mcp][AUDIT] 2026-05-19T15:42:01.123Z tool=create_pipeline_run target=pipeline=ETL_Daily caller=victor.perez@example.com status=ATTEMPT
+[adf-mcp][AUDIT] 2026-05-19T15:42:01.987Z tool=create_pipeline_run target=pipeline=ETL_Daily caller=victor.perez@example.com status=SUCCESS
+```
+
+The caller is parsed from the `upn` / `preferred_username` / `appid` / `oid` claims of the Entra access token. Forward your MCP client's server log somewhere durable if you need a long-term audit trail.
+
+### Recommended pairing for shared / CI deployments
+
+`ADF_MCP_MODE=write` + `ADF_AUTH_MODE=service-principal`. The SP gets exactly the RBAC it needs, the audit log identifies it consistently, and individual users don't need factory-Contributor on their personal accounts.
+
 ## Run standalone (for debugging)
 
 ```sh
@@ -113,6 +157,8 @@ The server speaks MCP over stdio, so running it directly will just block waiting
 | MCP client says "server failed to start"       | Wrong path in `args`, or Node not on PATH for the client's user                        | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal.   |
 | Calls hang or time out                         | ARM is throttling (HTTP 429) and the server is auto-retrying with backoff              | Check the MCP server's stderr log — each retry is logged. Up to 3 retries honoring `Retry-After`; on exhaustion, the call fails with the original 429. |
 | Activity output is `{ _truncated: true, ... }` | Default 4 KB truncation kicked in to protect the LLM context window                    | Pass `full=true` to `query_activity_runs` for the untruncated payload.                                                                                 |
+| LLM says "no tool to start a run / cancel"     | Server is in read-only mode (default)                                                  | Set `ADF_MCP_MODE=write` in the MCP client's `env` block and restart the client.                                                                       |
+| Write tool returns `403 Authorization failed`  | The identity has Reader but not Contributor on the factory                             | Grant **Data Factory Contributor** (or a narrower custom role with the relevant pipelineruns/triggers actions) to the user / SP / MI.                  |
 | `404` for a pipeline that exists               | Wrong factory in `ADF_FACTORY_RESOURCE_ID`                                             | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match).                                                  |
 
 For everything else, check the project [issues](https://github.com/user-vik/adf-mcp-server/issues).

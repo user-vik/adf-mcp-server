@@ -100,10 +100,15 @@ async function getToken() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Calls an arbitrary ARM path (already including /subscriptions/...).
-// Retries on HTTP 429, honoring Retry-After when present.
-async function armAt(method, fullArmPath, body) {
+// `extraQuery` lets callers add query parameters beyond api-version (used by
+// rerun / cancel endpoints). Retries on HTTP 429, honoring Retry-After.
+async function armAt(method, fullArmPath, body, extraQuery = {}) {
   const token = await getToken();
-  const url = `${ARM_BASE}${fullArmPath}?api-version=${API_VERSION}`;
+  const url = new URL(`${ARM_BASE}${fullArmPath}`);
+  url.searchParams.set("api-version", API_VERSION);
+  for (const [k, v] of Object.entries(extraQuery)) {
+    if (v != null) url.searchParams.set(k, String(v));
+  }
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const res = await fetch(url, {
       method,
@@ -133,8 +138,8 @@ async function armAt(method, fullArmPath, body) {
 }
 
 // Factory-scoped convenience wrapper. `path` is relative to the factory ARM ID.
-async function arm(method, path, body) {
-  return armAt(method, `${FACTORY_ID}${path}`, body);
+async function arm(method, path, body, extraQuery) {
+  return armAt(method, `${FACTORY_ID}${path}`, body, extraQuery);
 }
 
 function ok(obj) {
@@ -172,7 +177,61 @@ function maybeTruncate(value, max = TRUNCATE_CHARS) {
   };
 }
 
-const server = new McpServer({ name: "adf-mcp", version: "0.2.0" });
+// Extracts a human-meaningful subject from an Entra access token's middle
+// segment. Returns "unknown" on any parse failure — never throws, since this
+// is only used for audit logging.
+function parseTokenSubject(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return "unknown";
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return (
+      payload.upn ||
+      payload.preferred_username ||
+      payload.unique_name ||
+      payload.appid ||
+      payload.oid ||
+      "unknown"
+    );
+  } catch {
+    return "unknown";
+  }
+}
+
+// Wraps a mutating tool so each invocation is audit-logged to stderr with
+// timestamp, tool name, target resource, caller identity, and outcome.
+// Layered on top of safeTool — errors are still structured for the LLM.
+function writeTool(toolName, getTarget, handler) {
+  return safeTool(async (args) => {
+    const target = getTarget(args);
+    const token = await getToken();
+    const caller = parseTokenSubject(token);
+    const startedAt = new Date().toISOString();
+    console.error(
+      `[adf-mcp][AUDIT] ${startedAt} tool=${toolName} target=${target} caller=${caller} status=ATTEMPT`,
+    );
+    try {
+      const result = await handler(args);
+      console.error(
+        `[adf-mcp][AUDIT] ${new Date().toISOString()} tool=${toolName} target=${target} caller=${caller} status=SUCCESS`,
+      );
+      return result;
+    } catch (e) {
+      const msg = (e?.message ?? String(e)).slice(0, 200);
+      console.error(
+        `[adf-mcp][AUDIT] ${new Date().toISOString()} tool=${toolName} target=${target} caller=${caller} status=FAILURE error=${msg}`,
+      );
+      throw e;
+    }
+  });
+}
+
+const WRITE_ENABLED = (process.env.ADF_MCP_MODE ?? "read").toLowerCase() === "write";
+if (WRITE_ENABLED) {
+  console.error("[adf-mcp] write mode enabled — pipeline run + trigger control tools are exposed");
+}
+
+const server = new McpServer({ name: "adf-mcp", version: "0.3.0" });
 
 server.registerTool(
   "list_pipelines",
@@ -437,6 +496,135 @@ server.registerTool(
     return ok(summary);
   }),
 );
+
+// ─── Write tools — registered only when ADF_MCP_MODE=write ─────────────────
+
+if (WRITE_ENABLED) {
+  server.registerTool(
+    "create_pipeline_run",
+    {
+      description:
+        "Kick off a new run of a pipeline. Returns the new runId. WRITE OPERATION: this consumes ADF resources and may incur cost.",
+      inputSchema: {
+        pipeline_name: z.string().describe("The pipeline name"),
+        parameters: z
+          .record(z.unknown())
+          .optional()
+          .describe("Pipeline parameters, as a name→value object"),
+      },
+    },
+    writeTool(
+      "create_pipeline_run",
+      ({ pipeline_name }) => `pipeline=${pipeline_name}`,
+      async ({ pipeline_name, parameters }) => {
+        const data = await arm(
+          "POST",
+          `/pipelines/${encodeURIComponent(pipeline_name)}/createRun`,
+          parameters && Object.keys(parameters).length ? parameters : undefined,
+        );
+        return ok({ runId: data?.runId, pipelineName: pipeline_name });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "cancel_pipeline_run",
+    {
+      description: "Cancel an in-progress pipeline run. By default cancels child runs as well.",
+      inputSchema: {
+        run_id: z.string().describe("The pipeline run ID to cancel"),
+        recursive: z
+          .boolean()
+          .optional()
+          .describe("Cancel child pipeline runs too. Defaults to true."),
+      },
+    },
+    writeTool(
+      "cancel_pipeline_run",
+      ({ run_id }) => `run=${run_id}`,
+      async ({ run_id, recursive }) => {
+        await arm("POST", `/pipelineruns/${encodeURIComponent(run_id)}/cancel`, undefined, {
+          isRecursive: recursive ?? true,
+        });
+        return ok({ cancelled: true, runId: run_id });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "rerun_pipeline_run",
+    {
+      description:
+        "Re-execute a previous pipeline run. By default resumes from the failed activity (the common 'fix and retry' workflow); set from_failed_activity=false to replay from the beginning.",
+      inputSchema: {
+        pipeline_name: z.string().describe("The original pipeline name"),
+        reference_run_id: z.string().describe("The runId of the previous run to rerun"),
+        from_failed_activity: z
+          .boolean()
+          .optional()
+          .describe("Resume from the failed activity. Defaults to true."),
+      },
+    },
+    writeTool(
+      "rerun_pipeline_run",
+      ({ pipeline_name, reference_run_id }) => `pipeline=${pipeline_name} ref=${reference_run_id}`,
+      async ({ pipeline_name, reference_run_id, from_failed_activity }) => {
+        const data = await arm(
+          "POST",
+          `/pipelines/${encodeURIComponent(pipeline_name)}/createRun`,
+          undefined,
+          {
+            referencePipelineRunId: reference_run_id,
+            startFromFailure: from_failed_activity ?? true,
+          },
+        );
+        return ok({
+          runId: data?.runId,
+          pipelineName: pipeline_name,
+          referenceRunId: reference_run_id,
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "start_trigger",
+    {
+      description:
+        "Start a trigger so it begins firing per its schedule. Long-running; verify the resulting runtimeState with list_triggers.",
+      inputSchema: {
+        name: z.string().describe("The trigger name"),
+      },
+    },
+    writeTool(
+      "start_trigger",
+      ({ name }) => `trigger=${name}`,
+      async ({ name }) => {
+        await arm("POST", `/triggers/${encodeURIComponent(name)}/start`);
+        return ok({ started: true, trigger: name });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "stop_trigger",
+    {
+      description:
+        "Stop a trigger so it stops firing. Long-running; verify the resulting runtimeState with list_triggers.",
+      inputSchema: {
+        name: z.string().describe("The trigger name"),
+      },
+    },
+    writeTool(
+      "stop_trigger",
+      ({ name }) => `trigger=${name}`,
+      async ({ name }) => {
+        await arm("POST", `/triggers/${encodeURIComponent(name)}/stop`);
+        return ok({ stopped: true, trigger: name });
+      },
+    ),
+  );
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -55,16 +55,17 @@ Additive, low-risk:
 - [x] Structured tool errors (`{ isError: true, content: [...] }`) instead of
       throwing.
 
-## Stage 5 — Gated write tools (non-destructive)
+## Stage 5 — Gated write tools (non-destructive) _(done — shipped in 0.3.0)_
 
 Surface is opt-in. Tools below are registered only when
 `ADF_MCP_MODE=write`. Every call is audit-logged to stderr with timestamp,
-caller UPN (from the token), and target resource.
+caller identity (from the token), and target resource.
 
-- `create_pipeline_run` — kick off a run.
-- `cancel_pipeline_run` — stop a run.
-- `rerun_pipeline_run` — re-execute a previous run.
-- `start_trigger` / `stop_trigger` — toggle trigger state.
+- [x] `create_pipeline_run` — kick off a run.
+- [x] `cancel_pipeline_run` — stop a run (recursive by default).
+- [x] `rerun_pipeline_run` — re-execute a previous run; defaults to resuming
+      from the failed activity.
+- [x] `start_trigger` / `stop_trigger` — toggle trigger state.
 
 ## Stage 6 — Destructive writes with plan/apply confirmation
 

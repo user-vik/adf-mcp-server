@@ -41,19 +41,19 @@ factory selected by `ADF_AUTH_MODE`:
 Default preserves prior behavior. README + `.env.example` updated. Invalid
 modes or missing required env vars exit with a clear error at startup.
 
-## Stage 4 — Quality-of-life read tools
+## Stage 4 — Quality-of-life read tools _(done — shipped in 0.2.0)_
 
 Additive, low-risk:
 
-- `get_pipeline_run` — direct lookup for a single run.
-- `list_linked_services`, `list_datasets`, `list_integration_runtimes`.
-- `list_factories` — discover factories without knowing the full ARM ID.
-- Pagination for `query_pipeline_runs` (`continuationToken`).
-- Truncate large `output`/`input` blobs in `query_activity_runs` (default
-  ~4 KB, opt-in `full=true`) to protect the LLM context window.
-- Retry with `Retry-After` backoff on ARM 429 throttling.
-- Structured tool errors (`{ isError: true, content: [...] }`) instead of
-  throwing.
+- [x] `get_pipeline_run` — direct lookup for a single run.
+- [x] `list_linked_services`, `list_datasets`, `list_integration_runtimes`.
+- [x] `list_factories` — discover factories without knowing the full ARM ID.
+- [x] Pagination for `query_pipeline_runs` (`continuationToken`).
+- [x] Truncate large `output`/`input` blobs in `query_activity_runs` (default
+      ~4 KB, opt-in `full=true`) to protect the LLM context window.
+- [x] Retry with `Retry-After` backoff on ARM 429 throttling.
+- [x] Structured tool errors (`{ isError: true, content: [...] }`) instead of
+      throwing.
 
 ## Stage 5 — Gated write tools (non-destructive)
 

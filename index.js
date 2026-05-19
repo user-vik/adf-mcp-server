@@ -17,6 +17,15 @@ if (!FACTORY_ID) {
   process.exit(1);
 }
 
+const SUBSCRIPTION_MATCH = /^\/subscriptions\/([^/]+)/.exec(FACTORY_ID);
+if (!SUBSCRIPTION_MATCH) {
+  console.error(
+    `ADF_FACTORY_RESOURCE_ID does not look like a valid ARM ID (missing /subscriptions/<id>): ${FACTORY_ID}`,
+  );
+  process.exit(1);
+}
+const SUBSCRIPTION_ID = SUBSCRIPTION_MATCH[1];
+
 const AUTH_MODES = [
   "interactive",
   "device-code",
@@ -80,35 +89,90 @@ function buildCredential() {
 const credential = buildCredential();
 const API_VERSION = "2018-06-01";
 const ARM_BASE = "https://management.azure.com";
+const MAX_RETRIES = 3;
+const RETRY_MAX_DELAY_MS = 60_000;
 
 async function getToken() {
   const t = await credential.getToken("https://management.azure.com/.default");
   return t.token;
 }
 
-async function arm(method, path, body) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Calls an arbitrary ARM path (already including /subscriptions/...).
+// Retries on HTTP 429, honoring Retry-After when present.
+async function armAt(method, fullArmPath, body) {
   const token = await getToken();
-  const url = `${ARM_BASE}${FACTORY_ID}${path}?api-version=${API_VERSION}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`ADF ${method} ${path} -> ${res.status}: ${text}`);
+  const url = `${ARM_BASE}${fullArmPath}?api-version=${API_VERSION}`;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
+      const backoffMs = Number.isFinite(retryAfter)
+        ? Math.min(retryAfter * 1000, RETRY_MAX_DELAY_MS)
+        : Math.min(2 ** attempt * 500, RETRY_MAX_DELAY_MS);
+      console.error(
+        `[adf-mcp] ARM 429 throttled on ${method} ${fullArmPath}; retrying in ${backoffMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`,
+      );
+      await sleep(backoffMs);
+      continue;
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`ADF ${method} ${fullArmPath} -> ${res.status}: ${text}`);
+    }
+    return text ? JSON.parse(text) : null;
   }
-  return text ? JSON.parse(text) : null;
+}
+
+// Factory-scoped convenience wrapper. `path` is relative to the factory ARM ID.
+async function arm(method, path, body) {
+  return armAt(method, `${FACTORY_ID}${path}`, body);
 }
 
 function ok(obj) {
   return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
 }
 
-const server = new McpServer({ name: "adf-mcp", version: "0.1.0" });
+// Wraps a tool handler so any thrown error is returned as a structured
+// MCP tool error instead of escaping as a protocol-level failure. This lets
+// the LLM see the error message and react to it.
+function safeTool(handler) {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (e) {
+      const message = e?.message ?? String(e);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  };
+}
+
+const TRUNCATE_CHARS = 4096;
+
+// Truncate a value when its JSON representation exceeds `max` chars, returning
+// a small envelope describing the truncation. Used on activity input/output
+// blobs that can otherwise blow the LLM context window.
+function maybeTruncate(value, max = TRUNCATE_CHARS) {
+  if (value == null) return value;
+  const json = JSON.stringify(value);
+  if (json == null || json.length <= max) return value;
+  return {
+    _truncated: true,
+    _totalChars: json.length,
+    _preview: json.slice(0, max),
+    _hint: "Pass full=true to query_activity_runs to receive the untruncated payload.",
+  };
+}
+
+const server = new McpServer({ name: "adf-mcp", version: "0.2.0" });
 
 server.registerTool(
   "list_pipelines",
@@ -116,7 +180,7 @@ server.registerTool(
     description: "List all pipelines in the configured ADF factory.",
     inputSchema: {},
   },
-  async () => {
+  safeTool(async () => {
     const data = await arm("GET", "/pipelines");
     const summary = (data.value ?? []).map((p) => ({
       name: p.name,
@@ -126,7 +190,7 @@ server.registerTool(
       folder: p.properties?.folder?.name,
     }));
     return ok(summary);
-  },
+  }),
 );
 
 server.registerTool(
@@ -137,17 +201,17 @@ server.registerTool(
       name: z.string().describe("The pipeline name"),
     },
   },
-  async ({ name }) => {
+  safeTool(async ({ name }) => {
     const data = await arm("GET", `/pipelines/${encodeURIComponent(name)}`);
     return ok(data);
-  },
+  }),
 );
 
 server.registerTool(
   "query_pipeline_runs",
   {
     description:
-      "Query pipeline runs in a time window. Default window is the last 24 hours, ordered most-recent first.",
+      "Query pipeline runs in a time window. Default window is the last 24 hours, ordered most-recent first. Returns a continuationToken when more results are available; pass it back as continuation_token to fetch the next page.",
     inputSchema: {
       last_updated_after: z
         .string()
@@ -159,47 +223,75 @@ server.registerTool(
         .enum(["Succeeded", "Failed", "InProgress", "Cancelled", "Queued"])
         .optional()
         .describe("Filter by run status"),
+      continuation_token: z
+        .string()
+        .optional()
+        .describe("Continuation token from a previous response, for paging"),
     },
   },
-  async ({ last_updated_after, last_updated_before, pipeline_name, status }) => {
-    const now = new Date();
-    const before = last_updated_before ?? now.toISOString();
-    const after = last_updated_after ?? new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
-    const filters = [];
-    if (pipeline_name)
-      filters.push({
-        operand: "PipelineName",
-        operator: "Equals",
-        values: [pipeline_name],
-      });
-    if (status) filters.push({ operand: "Status", operator: "Equals", values: [status] });
-    const body = {
-      lastUpdatedAfter: after,
-      lastUpdatedBefore: before,
-      orderBy: [{ orderBy: "RunStart", order: "DESC" }],
-    };
-    if (filters.length) body.filters = filters;
-    const data = await arm("POST", "/queryPipelineRuns", body);
-    const summary = (data.value ?? []).map((r) => ({
-      runId: r.runId,
-      pipelineName: r.pipelineName,
-      status: r.status,
-      runStart: r.runStart,
-      runEnd: r.runEnd,
-      durationInMs: r.durationInMs,
-      message: r.message,
-      invokedBy: r.invokedBy?.name,
-      parameters: r.parameters,
-    }));
-    return ok(summary);
+  safeTool(
+    async ({
+      last_updated_after,
+      last_updated_before,
+      pipeline_name,
+      status,
+      continuation_token,
+    }) => {
+      const now = new Date();
+      const before = last_updated_before ?? now.toISOString();
+      const after = last_updated_after ?? new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+      const filters = [];
+      if (pipeline_name)
+        filters.push({
+          operand: "PipelineName",
+          operator: "Equals",
+          values: [pipeline_name],
+        });
+      if (status) filters.push({ operand: "Status", operator: "Equals", values: [status] });
+      const body = {
+        lastUpdatedAfter: after,
+        lastUpdatedBefore: before,
+        orderBy: [{ orderBy: "RunStart", order: "DESC" }],
+      };
+      if (filters.length) body.filters = filters;
+      if (continuation_token) body.continuationToken = continuation_token;
+      const data = await arm("POST", "/queryPipelineRuns", body);
+      const runs = (data.value ?? []).map((r) => ({
+        runId: r.runId,
+        pipelineName: r.pipelineName,
+        status: r.status,
+        runStart: r.runStart,
+        runEnd: r.runEnd,
+        durationInMs: r.durationInMs,
+        message: r.message,
+        invokedBy: r.invokedBy?.name,
+        parameters: r.parameters,
+      }));
+      return ok({ runs, continuationToken: data.continuationToken ?? null });
+    },
+  ),
+);
+
+server.registerTool(
+  "get_pipeline_run",
+  {
+    description:
+      "Get full details for a single pipeline run by ID. Use this when you already know the runId and want everything ARM returns about it.",
+    inputSchema: {
+      run_id: z.string().describe("The pipeline run ID"),
+    },
   },
+  safeTool(async ({ run_id }) => {
+    const data = await arm("GET", `/pipelineruns/${encodeURIComponent(run_id)}`);
+    return ok(data);
+  }),
 );
 
 server.registerTool(
   "query_activity_runs",
   {
     description:
-      "Query activity runs for a specific pipeline run. Use this to drill into which activity failed and read the error message.",
+      "Query activity runs for a specific pipeline run. Use this to drill into which activity failed and read the error message. Activity input/output payloads are truncated by default to protect context; pass full=true to receive them untruncated.",
     inputSchema: {
       pipeline_run_id: z.string().describe("The pipeline run ID (from query_pipeline_runs)"),
       last_updated_after: z
@@ -208,9 +300,13 @@ server.registerTool(
         .describe("ISO 8601 timestamp; defaults to now - 7d"),
       last_updated_before: z.string().optional().describe("ISO 8601 timestamp; defaults to now"),
       status: z.string().optional().describe("Filter by activity status (e.g., Failed, Succeeded)"),
+      full: z
+        .boolean()
+        .optional()
+        .describe("Return untruncated input/output blobs. Defaults to false."),
     },
   },
-  async ({ pipeline_run_id, last_updated_after, last_updated_before, status }) => {
+  safeTool(async ({ pipeline_run_id, last_updated_after, last_updated_before, status, full }) => {
     const now = new Date();
     const before = last_updated_before ?? now.toISOString();
     const after =
@@ -235,11 +331,11 @@ server.registerTool(
       activityRunEnd: a.activityRunEnd,
       durationInMs: a.durationInMs,
       error: a.error,
-      output: a.output,
-      input: a.input,
+      output: full ? a.output : maybeTruncate(a.output),
+      input: full ? a.input : maybeTruncate(a.input),
     }));
     return ok(summary);
-  },
+  }),
 );
 
 server.registerTool(
@@ -248,7 +344,7 @@ server.registerTool(
     description: "List all triggers in the factory and their runtime state.",
     inputSchema: {},
   },
-  async () => {
+  safeTool(async () => {
     const data = await arm("GET", "/triggers");
     const summary = (data.value ?? []).map((t) => ({
       name: t.name,
@@ -259,7 +355,87 @@ server.registerTool(
       annotations: t.properties?.annotations ?? [],
     }));
     return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_linked_services",
+  {
+    description: "List all linked services in the factory (databases, storage accounts, etc).",
+    inputSchema: {},
   },
+  safeTool(async () => {
+    const data = await arm("GET", "/linkedservices");
+    const summary = (data.value ?? []).map((ls) => ({
+      name: ls.name,
+      type: ls.properties?.type,
+      parameters: Object.keys(ls.properties?.parameters ?? {}),
+      annotations: ls.properties?.annotations ?? [],
+      connectVia: ls.properties?.connectVia?.referenceName,
+    }));
+    return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_datasets",
+  {
+    description: "List all datasets in the factory and the linked service each one belongs to.",
+    inputSchema: {},
+  },
+  safeTool(async () => {
+    const data = await arm("GET", "/datasets");
+    const summary = (data.value ?? []).map((d) => ({
+      name: d.name,
+      type: d.properties?.type,
+      linkedServiceName: d.properties?.linkedServiceName?.referenceName,
+      parameters: Object.keys(d.properties?.parameters ?? {}),
+      annotations: d.properties?.annotations ?? [],
+      folder: d.properties?.folder?.name,
+    }));
+    return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_integration_runtimes",
+  {
+    description:
+      "List all integration runtimes (IRs) in the factory and their type/state. Useful for spotting offline self-hosted IRs that cause pipeline failures.",
+    inputSchema: {},
+  },
+  safeTool(async () => {
+    const data = await arm("GET", "/integrationRuntimes");
+    const summary = (data.value ?? []).map((ir) => ({
+      name: ir.name,
+      type: ir.properties?.type,
+      description: ir.properties?.description,
+      state: ir.properties?.state,
+    }));
+    return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_factories",
+  {
+    description:
+      "List all Data Factory v2 instances visible in the current subscription (derived from ADF_FACTORY_RESOURCE_ID). Useful for discovering the ARM IDs of other factories.",
+    inputSchema: {},
+  },
+  safeTool(async () => {
+    const data = await armAt(
+      "GET",
+      `/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.DataFactory/factories`,
+    );
+    const summary = (data.value ?? []).map((f) => ({
+      name: f.name,
+      id: f.id,
+      location: f.location,
+      resourceGroup: /resourceGroups\/([^/]+)/.exec(f.id ?? "")?.[1],
+    }));
+    return ok(summary);
+  }),
 );
 
 const transport = new StdioServerTransport();

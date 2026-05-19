@@ -4,7 +4,7 @@ Staged plan for evolving `adf-mcp-server` from a read-only troubleshooting tool
 into a fully-featured ADF management surface for MCP clients. Stages are ordered
 least-intrusive to most-intrusive — each stage is shippable on its own.
 
-## Stage 1 — Low-touch docs *(in progress)*
+## Stage 1 — Low-touch docs
 
 Pure additions. No code change.
 
@@ -16,25 +16,27 @@ Pure additions. No code change.
 
 ## Stage 2 — Contributor scaffolding
 
-Configs and docs only; no source rewrites.
+Configs and docs. A one-shot Prettier pass normalized `index.js` to the new
+style; no behavior changes.
 
-- ESLint (flat config) + Prettier with `npm run lint` / `npm run format`.
-- `CONTRIBUTING.md` describing branching, Conventional Commits, and PR checklist.
-- `.github/ISSUE_TEMPLATE/bug.md`, `feature.md`, `pull_request_template.md`.
+- [x] ESLint (flat config) + Prettier with `npm run lint` / `npm run format`.
+- [x] `.gitattributes` for cross-platform LF line endings.
+- [x] `CONTRIBUTING.md` describing branching, Conventional Commits, and PR checklist.
+- [x] `.github/ISSUE_TEMPLATE/bug.md`, `feature.md`, `pull_request_template.md`.
 
 ## Stage 3 — Auth methods refactor
 
 Replace the hard-coded `InteractiveBrowserCredential` with a credential chain
 selected by `ADF_AUTH_MODE`:
 
-| `ADF_AUTH_MODE`     | Credential                     | Use case                                  |
-|---------------------|--------------------------------|-------------------------------------------|
-| `interactive` *(default)* | `InteractiveBrowserCredential` | Desktop devs                              |
-| `device-code`       | `DeviceCodeCredential`         | SSH / WSL / no browser                    |
-| `cli`               | `AzureCliCredential`           | Devs already signed in via `az login`     |
-| `service-principal` | `ClientSecretCredential`       | CI, shared servers, automation            |
-| `managed-identity`  | `ManagedIdentityCredential`    | MCP server hosted on Azure                |
-| `default`           | `DefaultAzureCredential`       | Chain that tries everything in turn       |
+| `ADF_AUTH_MODE`           | Credential                     | Use case                              |
+| ------------------------- | ------------------------------ | ------------------------------------- |
+| `interactive` _(default)_ | `InteractiveBrowserCredential` | Desktop devs                          |
+| `device-code`             | `DeviceCodeCredential`         | SSH / WSL / no browser                |
+| `cli`                     | `AzureCliCredential`           | Devs already signed in via `az login` |
+| `service-principal`       | `ClientSecretCredential`       | CI, shared servers, automation        |
+| `managed-identity`        | `ManagedIdentityCredential`    | MCP server hosted on Azure            |
+| `default`                 | `DefaultAzureCredential`       | Chain that tries everything in turn   |
 
 Default keeps current behavior. README + `.env.example` updated.
 

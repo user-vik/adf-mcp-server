@@ -9,9 +9,7 @@ const TENANT_ID = process.env.AZURE_TENANT_ID;
 const CLIENT_ID = process.env.AZURE_CLIENT_ID || "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
 if (!FACTORY_ID || !TENANT_ID) {
-  console.error(
-    "Missing required env vars. Need: ADF_FACTORY_RESOURCE_ID, AZURE_TENANT_ID"
-  );
+  console.error("Missing required env vars. Need: ADF_FACTORY_RESOURCE_ID, AZURE_TENANT_ID");
   process.exit(1);
 }
 
@@ -67,7 +65,7 @@ server.registerTool(
       folder: p.properties?.folder?.name,
     }));
     return ok(summary);
-  }
+  },
 );
 
 server.registerTool(
@@ -81,7 +79,7 @@ server.registerTool(
   async ({ name }) => {
     const data = await arm("GET", `/pipelines/${encodeURIComponent(name)}`);
     return ok(data);
-  }
+  },
 );
 
 server.registerTool(
@@ -94,14 +92,8 @@ server.registerTool(
         .string()
         .optional()
         .describe("ISO 8601 timestamp; defaults to now - 24h"),
-      last_updated_before: z
-        .string()
-        .optional()
-        .describe("ISO 8601 timestamp; defaults to now"),
-      pipeline_name: z
-        .string()
-        .optional()
-        .describe("Filter to a specific pipeline name"),
+      last_updated_before: z.string().optional().describe("ISO 8601 timestamp; defaults to now"),
+      pipeline_name: z.string().optional().describe("Filter to a specific pipeline name"),
       status: z
         .enum(["Succeeded", "Failed", "InProgress", "Cancelled", "Queued"])
         .optional()
@@ -111,9 +103,7 @@ server.registerTool(
   async ({ last_updated_after, last_updated_before, pipeline_name, status }) => {
     const now = new Date();
     const before = last_updated_before ?? now.toISOString();
-    const after =
-      last_updated_after ??
-      new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+    const after = last_updated_after ?? new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
     const filters = [];
     if (pipeline_name)
       filters.push({
@@ -121,8 +111,7 @@ server.registerTool(
         operator: "Equals",
         values: [pipeline_name],
       });
-    if (status)
-      filters.push({ operand: "Status", operator: "Equals", values: [status] });
+    if (status) filters.push({ operand: "Status", operator: "Equals", values: [status] });
     const body = {
       lastUpdatedAfter: after,
       lastUpdatedBefore: before,
@@ -142,7 +131,7 @@ server.registerTool(
       parameters: r.parameters,
     }));
     return ok(summary);
-  }
+  },
 );
 
 server.registerTool(
@@ -151,37 +140,22 @@ server.registerTool(
     description:
       "Query activity runs for a specific pipeline run. Use this to drill into which activity failed and read the error message.",
     inputSchema: {
-      pipeline_run_id: z
-        .string()
-        .describe("The pipeline run ID (from query_pipeline_runs)"),
+      pipeline_run_id: z.string().describe("The pipeline run ID (from query_pipeline_runs)"),
       last_updated_after: z
         .string()
         .optional()
         .describe("ISO 8601 timestamp; defaults to now - 7d"),
-      last_updated_before: z
-        .string()
-        .optional()
-        .describe("ISO 8601 timestamp; defaults to now"),
-      status: z
-        .string()
-        .optional()
-        .describe("Filter by activity status (e.g., Failed, Succeeded)"),
+      last_updated_before: z.string().optional().describe("ISO 8601 timestamp; defaults to now"),
+      status: z.string().optional().describe("Filter by activity status (e.g., Failed, Succeeded)"),
     },
   },
-  async ({
-    pipeline_run_id,
-    last_updated_after,
-    last_updated_before,
-    status,
-  }) => {
+  async ({ pipeline_run_id, last_updated_after, last_updated_before, status }) => {
     const now = new Date();
     const before = last_updated_before ?? now.toISOString();
     const after =
-      last_updated_after ??
-      new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
+      last_updated_after ?? new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
     const filters = [];
-    if (status)
-      filters.push({ operand: "Status", operator: "Equals", values: [status] });
+    if (status) filters.push({ operand: "Status", operator: "Equals", values: [status] });
     const body = {
       lastUpdatedAfter: after,
       lastUpdatedBefore: before,
@@ -190,7 +164,7 @@ server.registerTool(
     const data = await arm(
       "POST",
       `/pipelineruns/${encodeURIComponent(pipeline_run_id)}/queryActivityruns`,
-      body
+      body,
     );
     const summary = (data.value ?? []).map((a) => ({
       activityName: a.activityName,
@@ -204,7 +178,7 @@ server.registerTool(
       input: a.input,
     }));
     return ok(summary);
-  }
+  },
 );
 
 server.registerTool(
@@ -219,14 +193,12 @@ server.registerTool(
       name: t.name,
       type: t.properties?.type,
       runtimeState: t.properties?.runtimeState,
-      pipelines: (t.properties?.pipelines ?? []).map(
-        (p) => p.pipelineReference?.referenceName
-      ),
+      pipelines: (t.properties?.pipelines ?? []).map((p) => p.pipelineReference?.referenceName),
       recurrence: t.properties?.typeProperties?.recurrence,
       annotations: t.properties?.annotations ?? [],
     }));
     return ok(summary);
-  }
+  },
 );
 
 const transport = new StdioServerTransport();

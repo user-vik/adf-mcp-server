@@ -75,6 +75,29 @@ ADF_FACTORY_RESOURCE_ID=... AZURE_TENANT_ID=... node index.js
 
 The server speaks MCP over stdio, so running it directly will just block waiting for an MCP client to connect via stdin/stdout. Useful only to confirm it starts without crashing.
 
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `Missing required env vars` on startup | `ADF_FACTORY_RESOURCE_ID` or `AZURE_TENANT_ID` not set in the MCP client's `env` block | Add them to the client config and restart the client. |
+| Tool call returns `403` from ARM | Your account lacks RBAC on the factory | Ask the resource owner to grant at least **Reader** on the Data Factory resource (Portal → ADF → Access control (IAM)). |
+| Tool call returns `401` / token errors | Conditional Access or MFA blocked the silent token | Sign out of Azure CLI / browser sessions, then re-trigger any tool to force a fresh interactive sign-in. |
+| Browser tab never opens on first call | Running over SSH / inside WSL / on a headless host | Interactive browser auth needs a desktop. See Roadmap → Stage 3 for the upcoming `device-code` mode; until then, run the client on a machine with a browser. |
+| MCP client says "server failed to start" | Wrong path in `args`, or Node not on PATH for the client's user | Verify the path with `node "C:\\path\\to\\index.js"` from a fresh shell. On Windows, the MCP client may inherit a different PATH than your terminal. |
+| Calls hang or time out | ARM is throttling (HTTP 429) — currently surfaced as a generic error | Retry after 30–60 s. Automatic backoff is on the Roadmap (Stage 4). |
+| `404` for a pipeline that exists | Wrong factory in `ADF_FACTORY_RESOURCE_ID` | Confirm the ARM ID matches the factory you expect (subscription, resource group, and name all match). |
+
+For everything else, check the project [issues](https://github.com/user-vik/adf-mcp-server/issues).
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the staged plan — additional auth methods,
+write-capable tools (run/cancel/start/stop), packaging, and more.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

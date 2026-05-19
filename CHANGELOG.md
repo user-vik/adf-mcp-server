@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `index.js` reformatted by Prettier to match the new project style (no
   behavior changes).
 
+### Security
+- Resolved 4 advisories (1 high, 3 moderate) in transitive dependencies of
+  `@modelcontextprotocol/sdk` via `npm audit fix`: `fast-uri`,
+  `hono`/`@hono/node-server`, `express-rate-limit`, `ip-address`. All affected
+  packages are HTTP-transport code paths that are not loaded at runtime by
+  this stdio-only server, so practical exposure was zero. Patch/minor bumps
+  only; no `package.json` changes.
+
 ## [0.1.0] - 2026-04-27
 
 ### Added

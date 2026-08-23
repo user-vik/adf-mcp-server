@@ -81,10 +81,9 @@ Gated behind both `ADF_MCP_MODE=write` and `ADF_MCP_ALLOW_DELETE=true`.
 ## Stage 7 — Packaging & distribution _(done — shipped in 1.0.0)_
 
 - [x] CI workflow (lint + format:check + audit on push/PR).
-- [x] Release workflow (npm publish with provenance on `v*` tag push).
 - [x] Dockerfile (multi-stage, non-root) for managed-identity hosting.
 - [x] `SECURITY.md` with disclosure process and known limitations.
-- [x] `package.json` `files` allowlist + `keywords` for npm discovery.
+- [x] `package.json` `files` allowlist + `keywords`.
 - [x] Server version read from `package.json` (single source of truth).
 - [x] Plan-store size cap (100) to bound memory.
 - [x] Cut `1.0.0` — first release with stable contract.

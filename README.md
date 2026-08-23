@@ -51,17 +51,7 @@ Wraps the ADF REST API as MCP tools so an AI agent (Claude Code, Claude Desktop,
 
 ## Install
 
-### From npm (recommended)
-
-```sh
-# One-off run via npx — no global install needed
-npx adf-mcp-server
-
-# Or install globally
-npm install -g adf-mcp-server
-```
-
-### From source (for development or to pin to a commit)
+### From source / GitHub
 
 ```sh
 git clone https://github.com/user-vik/adf-mcp-server

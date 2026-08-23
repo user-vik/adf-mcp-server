@@ -18,17 +18,13 @@ SemVer kicks in.
 - GitHub Actions **CI workflow** (`.github/workflows/ci.yml`) running
   `npm run lint`, `npm run format:check`, `node --check index.js`, and
   `npm audit --omit=dev` on every push and PR.
-- GitHub Actions **release workflow** (`.github/workflows/release.yml`)
-  publishing to npm with provenance when a `v*` tag is pushed. Requires
-  a `NPM_TOKEN` repository secret.
 - **`Dockerfile`** (multi-stage, alpine, non-root) for hosting the server
   on Azure with managed identity. Companion `.dockerignore`.
 - **`SECURITY.md`** with explicit disclosure process, in/out-of-scope
   items, and a list of known design limitations.
-- README sections: "Install from npm", "Docker / managed identity",
+- README sections: install, "Docker / managed identity",
   and a link to `SECURITY.md`.
-- `package.json` gains `files`, `publishConfig`, and `keywords` for npm
-  discoverability and to keep the published tarball minimal.
+- `package.json` gains `files` and `keywords`.
 - Plan-store capacity cap (`PLAN_STORE_MAX = 100`) — when full,
   the oldest entry is evicted before insert. Prevents memory exhaustion
   if a buggy client floods plans faster than the TTL sweep runs.
